@@ -1,6 +1,6 @@
 The one-liner to run on a fresh Debian 13 machine
 
-wget -O devplatformbootstrap.sh https://raw.githubusercontent.com/Korplin/LinuxDevPlatformBootstrap/main/devplatformbootstrap.sh && bash devplatformbootstrap.sh
+wget -O devplatformbootstrap.sh https://raw.githubusercontent.com/Korplin/LinuxDevPlatformBootstrap2/main/devplatformbootstrap.sh && bash devplatformbootstrap.sh
 
 The script self-elevates with sudo if you're not root, so no prefix needed. When Ansible starts, it will prompt BECOME password: — enter your user password there.
 
