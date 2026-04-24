@@ -507,6 +507,18 @@
         - /etc/apt/keyrings/packages.microsoft.gpg
         - /etc/apt/keyrings/microsoft.gpg
 
+    - name: "[VSCODE] Remove existing/conflicting VS Code apt source files"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/apt/sources.list.d/vscode.list
+        - /etc/apt/sources.list.d/vscode.sources
+        - /etc/apt/sources.list.d/code.list
+        - /etc/apt/sources.list.d/packages.microsoft.com_repos_code.list
+
+
+
 
     - name: "[VSCODE] Ensure required tools are installed"
       ansible.builtin.apt:
