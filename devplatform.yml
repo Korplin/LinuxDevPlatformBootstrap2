@@ -193,17 +193,6 @@
     # SECTION 3 — GPU AND VIRTUALISATION DRIVERS
     # ==========================================================================
 
-    - name: "[GPU] Install VirtualBox guest utilities"
-      ansible.builtin.apt:
-        name:
-          - virtualbox-guest-utils   # shared folders, clipboard, drag-and-drop
-          - virtualbox-guest-x11     # display integration and auto-resize
-        state: present
-      when: is_virtualbox
-      # Reason: VirtualBox guest additions enable seamless mouse, shared
-      # clipboard, dynamic screen resolution, and accelerated display.
-      # Physical GPU driver tasks are skipped when running inside VirtualBox.
-
     - name: "[GPU] Install KVM/QEMU guest utilities"
       ansible.builtin.apt:
         name:
