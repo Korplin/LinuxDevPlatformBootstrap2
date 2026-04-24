@@ -127,133 +127,249 @@
       # writing sources.list so subsequent tasks see the new components.
 
     # ==========================================================================
-    # SECTION 2 — VM AND GPU DETECTION
+    # SECTION 1 — ENVIRONMENT DETECTION
+    # gather_facts gives us OS, CPU, memory.
+    # GPU and virtualisation require querying hardware directly.
     # ==========================================================================
 
-    - name: "[DETECT] Install dmidecode and pciutils"
-      ansible.builtin.apt:
-        name:
-          - dmidecode   # reads SMBIOS/DMI data for VM detection
-          - pciutils    # provides lspci for GPU detection
-        state: present
-
-    - name: "[DETECT] Query system product name"
+    - name: "[detect] Query PCI devices"
       ansible.builtin.shell:
-        cmd: dmidecode -s system-product-name 2>/dev/null || echo "Unknown"
-      register: _system_product
+        cmd: lspci -nn
+      register: lspci_output
+      changed_when: false
+
+    - name: "[detect] Detect virtualisation platform"
+      # systemd-detect-virt returns: oracle (VirtualBox), kvm, vmware, none, etc.
+      # Exit code 1 on bare metal — that is expected behaviour, not an error.
+      ansible.builtin.command:
+        cmd: systemd-detect-virt
+      register: virt_detect
       changed_when: false
       failed_when: false
 
-    - name: "[DETECT] Query system manufacturer"
-      ansible.builtin.shell:
-        cmd: dmidecode -s system-manufacturer 2>/dev/null || echo "Unknown"
-      register: _system_manufacturer
-      changed_when: false
-      failed_when: false
-
-    - name: "[DETECT] Query VGA adapter via lspci"
-      ansible.builtin.shell:
-        cmd: lspci | grep -i vga 2>/dev/null || echo ""
-      register: _gpu_info
-      changed_when: false
-      failed_when: false
-
-    - name: "[DETECT] Derive platform and GPU boolean facts"
+    - name: "[detect] Set environment facts"
       ansible.builtin.set_fact:
-        is_virtualbox: >-
-          {{ 'VIRTUALBOX' in (_system_product.stdout | upper) or
-             'VIRTUALBOX' in (_system_manufacturer.stdout | upper) }}
-        is_kvm: >-
-          {{ 'QEMU' in (_system_product.stdout | upper) or
-             'QEMU' in (_system_manufacturer.stdout | upper) or
-             'KVM'  in (_system_product.stdout | upper) or
-             'KVM'  in (_system_manufacturer.stdout | upper) }}
-        has_nvidia: >-
-          {{ 'NVIDIA' in (_gpu_info.stdout | upper) }}
-        has_amd: >-
-          {{ 'AMD'     in (_gpu_info.stdout | upper) or
-             'RADEON'  in (_gpu_info.stdout | upper) or
-             'ADVANCED MICRO' in (_gpu_info.stdout | upper) }}
-        has_intel_gpu: >-
-          {{ 'INTEL' in (_gpu_info.stdout | upper) }}
+        is_virtualbox: "{{ virt_detect.stdout == 'oracle' }}"
+        is_kvm_guest:  "{{ virt_detect.stdout in ['kvm', 'qemu'] }}"
+        is_vmware:     "{{ virt_detect.stdout == 'vmware' }}"
+        is_bare_metal: "{{ virt_detect.stdout == 'none' }}"
+        has_nvidia:    "{{ 'NVIDIA' in lspci_output.stdout | upper }}"
+        has_amd:       "{{ ('AMD' in lspci_output.stdout | upper) or ('ATI' in lspci_output.stdout | upper) }}"
+        has_intel_gpu: "{{ 'Intel' in lspci_output.stdout and ('VGA' in lspci_output.stdout or 'Display' in lspci_output.stdout) }}"
 
-    - name: "[DETECT] Print detection summary"
+    - name: "[detect] Show detected environment"
       ansible.builtin.debug:
         msg:
-          - "Product      : {{ _system_product.stdout | trim }}"
-          - "Manufacturer : {{ _system_manufacturer.stdout | trim }}"
-          - "GPU line     : {{ _gpu_info.stdout | trim }}"
-          - "VirtualBox   : {{ is_virtualbox }}"
-          - "KVM/QEMU     : {{ is_kvm }}"
-          - "NVIDIA GPU   : {{ has_nvidia }}"
-          - "AMD GPU      : {{ has_amd }}"
-          - "Intel GPU    : {{ has_intel_gpu }}"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - "  Environment : {{ virt_detect.stdout | default('bare metal') }}"
+          - "  Bare metal  : {{ is_bare_metal }}"
+          - "  VirtualBox  : {{ is_virtualbox }}"
+          - "  KVM/QEMU    : {{ is_kvm_guest }}"
+          - "  NVIDIA GPU  : {{ has_nvidia }}"
+          - "  AMD GPU     : {{ has_amd }}"
+          - "  Intel GPU   : {{ has_intel_gpu }}"
+          - "  Dev user    : {{ dev_user }}"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
 
     # ==========================================================================
-    # SECTION 3 — GPU AND VIRTUALISATION DRIVERS
+    # SECTION 5 — GPU DRIVERS AND VM GUEST TOOLS
+    # Branches based on detected environment.
+    # Each branch is mutually exclusive — only one will execute per run.
     # ==========================================================================
 
-    - name: "[GPU] Install linux kernel headers (required for NVIDIA DKMS)"
+    # ── Branch A: VirtualBox guest ────────────────────────────────────────────
+    #
+    # Guest Additions are installed from the VirtualBox ISO — NOT from apt.
+    # Reason: the apt packages (virtualbox-guest-*) were removed from Debian 13.
+    # The ISO method also guarantees the version matches your VirtualBox host.
+    #
+    # STUDENT ACTION — do this BEFORE running bootstrap.sh:
+    #   VirtualBox menu → Devices → Insert Guest Additions CD Image
+    #
+    # If the ISO is inserted, this section mounts it and installs automatically.
+    # If it is missing, a clear warning prints and the run continues without it.
+    # Re-running bootstrap.sh after inserting the ISO will complete this step.
+
+    - name: "[gpu/vm] Check if Guest Additions are already installed"
+      ansible.builtin.stat:
+        path: /sbin/rcvboxadd
+      register: vbox_ga_installed
+      when: is_virtualbox
+
+    - name: "[gpu/vm] Check if Guest Additions ISO is present at /dev/cdrom"
+      ansible.builtin.stat:
+        path: /dev/cdrom
+      register: cdrom_stat
+      when:
+        - is_virtualbox
+        - not vbox_ga_installed.stat.exists
+
+    - name: "[gpu/vm] Warn if Guest Additions ISO is not inserted"
+      ansible.builtin.debug:
+        msg:
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - "  ⚠  Guest Additions ISO not found at /dev/cdrom"
+          - "     Clipboard sharing and auto-resize will NOT work."
+          - ""
+          - "  Fix: VirtualBox menu → Devices → Insert Guest Additions CD"
+          - "       Then re-run bootstrap.sh — this step will complete."
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      when:
+        - is_virtualbox
+        - not vbox_ga_installed.stat.exists
+        - not cdrom_stat.stat.exists
+
+    - name: "[gpu/vm] Create mount point for Guest Additions ISO"
+      ansible.builtin.file:
+        path: /mnt/vbox-ga
+        state: directory
+        mode: '0755'
+      when:
+        - is_virtualbox
+        - not vbox_ga_installed.stat.exists
+        - cdrom_stat.stat.exists
+
+    - name: "[gpu/vm] Mount Guest Additions ISO"
+      ansible.builtin.mount:
+        path: /mnt/vbox-ga
+        src: /dev/cdrom
+        fstype: iso9660
+        opts: ro
+        state: mounted
+      when:
+        - is_virtualbox
+        - not vbox_ga_installed.stat.exists
+        - cdrom_stat.stat.exists
+
+    - name: "[gpu/vm] Install VirtualBox Guest Additions from ISO"
+      ansible.builtin.shell:
+        cmd: /mnt/vbox-ga/VBoxLinuxAdditions.run --nox11
+      register: vbox_ga_result
+      failed_when: vbox_ga_result.rc not in [0, 1, 2]
+      when:
+        - is_virtualbox
+        - not vbox_ga_installed.stat.exists
+        - cdrom_stat.stat.exists
+      # --nox11: skip X11 guest components.
+      # KDE Plasma 6 on Debian 13 runs on Wayland — X11 drivers are irrelevant.
+      # Without --nox11 the installer tries to install X11 components, fails
+      # on parts it cannot find, and exits with code 1 even on success.
+      #
+      # WHY rc in [0, 1] is acceptable:
+      # Exit 0 = full success.
+      # Exit 1 = partial success (some optional component skipped — expected).
+      # Exit 2+ = real failure — we want those to surface.
+
+    - name: "[gpu/vm] Show Guest Additions installer output"
+      ansible.builtin.debug:
+        msg: "{{ vbox_ga_result.stdout_lines | default([]) }}"
+      when:
+        - is_virtualbox
+        - not vbox_ga_installed.stat.exists
+        - vbox_ga_result is defined
+
+    - name: "[gpu/vm] Unmount Guest Additions ISO"
+      ansible.builtin.mount:
+        path: /mnt/vbox-ga
+        state: unmounted
+      when:
+        - is_virtualbox
+        - not vbox_ga_installed.stat.exists
+        - cdrom_stat.stat.exists
+
+    - name: "[gpu/vm] Guest Additions already installed — skipping"
+      ansible.builtin.debug:
+        msg: "VirtualBox Guest Additions already installed. Nothing to do."
+      when:
+        - is_virtualbox
+        - vbox_ga_installed.stat.exists
+
+    # ── Branch B: KVM/QEMU guest ──────────────────────────────────────────────
+    - name: "[gpu/vm] Install KVM/QEMU guest tools"
       ansible.builtin.apt:
         name:
-          - linux-headers-amd64   # metapackage — always tracks the running kernel
+          - spice-vdagent       # clipboard sharing, auto-resolution with SPICE
+          - qemu-guest-agent    # host-to-guest communication channel
+          # NOTE: xserver-xorg-video-qxl was removed from Debian 13.
+          # Wayland handles KVM display integration without X11 video drivers.
         state: present
-      when: has_nvidia and not is_virtualbox and not is_kvm
-      # Reason: The proprietary NVIDIA driver uses DKMS to compile a kernel
-      # module against the running kernel. Without the matching headers, DKMS
-      # compilation fails silently — the system boots but NVIDIA is not loaded.
-      # linux-headers-amd64 is a metapackage that always depends on the current
-      # kernel's headers, so it remains correct after kernel upgrades.
+      when: is_kvm_guest
 
-    - name: "[GPU] Install NVIDIA proprietary driver"
+    # ── Branch C: NVIDIA on bare metal ───────────────────────────────────────
+    # nvidia-detect reads your GPU's PCI ID and outputs the exact driver package
+    # name to install. This handles legacy cards automatically —
+    # e.g. GTX 560 Ti needs nvidia-legacy-390xx-driver, not nvidia-driver.
+    - name: "[gpu/nvidia] Install nvidia-detect"
       ansible.builtin.apt:
-        name:
-          - nvidia-driver    # proprietary driver for GTX 500+ series
-          - nvidia-settings  # GUI control panel for NVIDIA settings
+        name: nvidia-detect
         state: present
-      when: has_nvidia and not is_virtualbox and not is_kvm
-      register: _nvidia_install
-      ignore_errors: true
-      # Reason: nvidia-driver lives in non-free. ignore_errors: true prevents
-      # a hard failure if a DKMS build is unavailable for the running kernel;
-      # the nouveau blacklist task below only fires on a successful install.
+      when: has_nvidia and is_bare_metal
 
-    - name: "[GPU] Blacklist nouveau (open-source NVIDIA driver)"
-      ansible.builtin.copy:
-        dest: /etc/modprobe.d/blacklist-nouveau.conf
-        owner: root
-        group: root
-        mode: "0644"
-        content: |
-          # Managed by devplatform.yml — do not edit manually.
-          blacklist nouveau
-          options nouveau modeset=0
+    - name: "[gpu/nvidia] Run nvidia-detect"
+      ansible.builtin.command:
+        cmd: nvidia-detect
+      register: nvidia_detect_output
+      changed_when: false
+      failed_when: false
+      when: has_nvidia and is_bare_metal
+
+    - name: "[gpu/nvidia] Show nvidia-detect recommendation"
+      ansible.builtin.debug:
+        msg: "{{ nvidia_detect_output.stdout_lines | default(['nvidia-detect not run']) }}"
+      when: has_nvidia and is_bare_metal
+
+    - name: "[gpu/nvidia] Extract recommended driver package name"
+      ansible.builtin.set_fact:
+        nvidia_driver_pkg: >-
+          {{ (nvidia_detect_output.stdout_lines | default([]))
+             | select('match', '^\\s+nvidia')
+             | map('trim')
+             | list
+             | first
+             | default('nvidia-driver') }}
+      when: has_nvidia and is_bare_metal
+
+    - name: "[gpu/nvidia] Install NVIDIA driver: {{ nvidia_driver_pkg | default('detection pending') }}"
+      ansible.builtin.apt:
+        name: "{{ nvidia_driver_pkg }}"
+        state: present
       when:
         - has_nvidia
-        - not is_virtualbox
-        - not is_kvm
-        - _nvidia_install is defined
-        - _nvidia_install is succeeded
-      # Reason: The proprietary NVIDIA driver and the open-source nouveau
-      # driver cannot coexist. This modprobe rule prevents the kernel from
-      # loading nouveau at boot, which is required for nvidia-driver to init.
+        - is_bare_metal
+        - nvidia_driver_pkg is defined
 
-    - name: "[GPU] Install AMD GPU driver packages"
+    # ── Branch D: AMD on bare metal ──────────────────────────────────────────
+    - name: "[gpu/amd] Install AMD GPU firmware and Mesa driver stack"
       ansible.builtin.apt:
         name:
-          - firmware-amd-graphics        # GPU firmware blobs (required for amdgpu)
-          - libgl1-mesa-dri              # OpenGL via Mesa (radeonsi driver)
-          - xserver-xorg-video-amdgpu    # Xorg DDX driver for AMD
+          - firmware-amd-graphics
+          - xserver-xorg-video-amdgpu
+          - libgl1-mesa-dri
+          - mesa-vulkan-drivers
+          - vulkan-tools
         state: present
-      when: has_amd and not is_virtualbox and not is_kvm
+      when: has_amd and is_bare_metal
 
-    - name: "[GPU] Install Intel GPU driver packages"
+    # ── Branch E: Intel integrated GPU on bare metal ─────────────────────────
+    - name: "[gpu/intel] Install Intel GPU drivers and VA-API acceleration"
       ansible.builtin.apt:
         name:
-          - intel-media-va-driver   # VA-API hardware video acceleration (Gen8+)
-          - libgl1-mesa-dri         # OpenGL via Mesa (iris / i965 driver)
+          - intel-media-va-driver    # VA-API hardware video decode
+          - libgl1-mesa-dri
+          - mesa-vulkan-drivers
         state: present
-      when: has_intel_gpu and not is_virtualbox and not is_kvm
+      when: has_intel_gpu and is_bare_metal
+      ignore_errors: true
+      # NOTE: xserver-xorg-video-intel and i965-va-driver were removed from
+      # Debian 13. Modern Intel GPUs use the modesetting Xorg driver (built in)
+      # and iris Mesa driver automatically — no explicit package needed.
+      # ignore_errors: true is here as a safety net, not because we expect failure.
+
+
+
+
+
 
     # ==========================================================================
     # SECTION 4 — WIRELESS AND HARDWARE FIRMWARE
@@ -280,7 +396,7 @@
     - name: "[KDE] Install KDE Plasma, SDDM, and core KDE applications"
       ansible.builtin.apt:
         name:
-          - kde-full                          # complete KDE Plasma metapackage
+          - kde-standard                          # complete KDE Plasma metapackage
           - sddm                              # Simple Desktop Display Manager
           - plasma-nm                         # NetworkManager applet for KDE
           - konsole                           # KDE terminal emulator
@@ -587,69 +703,105 @@
         state: present
 
     # ==========================================================================
-    # SECTION 11 — CURSOR IDE (.deb package)
+    # SECTION 15 — CURSOR IDE
     # ==========================================================================
-    # Cursor does not publish an apt repository. Their API endpoint returns a
-    # JSON object whose 'debUrl' field contains the versioned .deb download URL.
-    # Example response:
-    #   { "debUrl": "https://downloads.cursor.com/production/<sha>/...amd64.deb",
-    #     "version": "3.1.17", "commitSha": "...", ... }
-    # We resolve the URL at playbook runtime so we always get the latest release
-    # without hardcoding a version string that goes stale on the next release.
 
-    - name: "[CURSOR] Check if Cursor is already installed"
-      ansible.builtin.command:
-        cmd: dpkg-query -W -f='${Status}' cursor
-      register: _cursor_dpkg
-      changed_when: false
-      failed_when: false
-      # Reason: Exit code 1 means not installed. We use this as the idempotency
-      # guard for all subsequent Cursor tasks. To upgrade Cursor:
-      #   sudo apt remove cursor && ansible-playbook /tmp/devplatform.yml
+    - name: "[cursor] Check whether Cursor binary already exists"
+      ansible.builtin.stat:
+        path: /usr/bin/cursor
+      register: cursor_binary_stat
 
-    - name: "[CURSOR] Resolve latest .deb URL from Cursor API"
+    - name: "[cursor] Ensure package helper for .deb handling is present"
+      ansible.builtin.apt:
+        name: xz-utils
+        state: present
+        update_cache: false
+        lock_timeout: 300
+      when: not cursor_binary_stat.stat.exists
+
+    - name: "[cursor] Fetch Cursor download metadata"
       ansible.builtin.uri:
-        url: "{{ cursor_api_url }}"
+        url: "https://www.cursor.com/api/download?platform=linux-x64&releaseTrack=stable"
         method: GET
         return_content: true
         status_code: 200
-        headers:
-          Accept: "application/json"
-      register: _cursor_api
-      when: _cursor_dpkg.rc != 0 or 'install ok installed' not in _cursor_dpkg.stdout
-      # Reason: The API returns JSON containing debUrl, version, commitSha, etc.
-      # ansible.builtin.uri parses JSON automatically when Content-Type is
-      # application/json, making the field available as _cursor_api.json.debUrl.
+        timeout: 30
+      register: cursor_api_response
+      when: not cursor_binary_stat.stat.exists
 
-    - name: "[CURSOR] Download Cursor .deb package"
+    - name: "[cursor] Parse Cursor metadata"
+      ansible.builtin.set_fact:
+        cursor_api_json: "{{ cursor_api_response.content | from_json }}"
+        cursor_deb_url: "{{ (cursor_api_response.content | from_json).debUrl }}"
+        cursor_expected_version: "{{ (cursor_api_response.content | from_json).version }}"
+      when: not cursor_binary_stat.stat.exists
+
+    - name: "[cursor] Validate Cursor deb URL from API"
+      ansible.builtin.assert:
+        that:
+          - cursor_deb_url is defined
+          - cursor_deb_url is string
+          - cursor_deb_url | length > 0
+          - cursor_deb_url != "null"
+          - cursor_deb_url is match('^https://')
+        fail_msg: >-
+          Cursor API did not return a valid debUrl.
+          Raw response: {{ cursor_api_response.content | default('<no content>') }}
+      when: not cursor_binary_stat.stat.exists
+
+    - name: "[cursor] Download Cursor Debian package"
       ansible.builtin.get_url:
-        url: "{{ _cursor_api.json.debUrl }}"
-        dest: /tmp/cursor-latest.deb
+        url: "{{ cursor_deb_url }}"
+        dest: /tmp/cursor.deb
         mode: "0644"
+        timeout: 300
         force: true
-        timeout: 180
-      when: _cursor_dpkg.rc != 0 or 'install ok installed' not in _cursor_dpkg.stdout
-      # Reason: Using the resolved CDN URL (not the API endpoint) as the download
-      # target avoids any redirect chains and ensures we get exactly the version
-      # the API advertised.
+      register: cursor_download_result
+      when: not cursor_binary_stat.stat.exists
 
-    - name: "[CURSOR] Install Cursor .deb package"
+    - name: "[cursor] Install Cursor IDE from downloaded .deb"
       ansible.builtin.apt:
-        deb: /tmp/cursor-latest.deb
+        deb: /tmp/cursor.deb
         state: present
-      when: _cursor_dpkg.rc != 0 or 'install ok installed' not in _cursor_dpkg.stdout
-      # Reason: ansible.builtin.apt with deb: installs via dpkg, registers the
-      # package in the apt database, and resolves any declared dependencies.
-      # Using .deb instead of AppImage means:
-      #   - No libfuse2 dependency
-      #   - No --no-sandbox workaround needed (sandbox works correctly)
-      #   - Proper system-wide installation under /usr/
-      #   - Registered in dpkg — 'apt remove cursor' works cleanly
+        force_apt_get: true
+        lock_timeout: 300
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      register: cursor_install_result
+      when: not cursor_binary_stat.stat.exists
 
-    - name: "[CURSOR] Remove downloaded .deb package"
+    - name: "[cursor] Remove downloaded package"
       ansible.builtin.file:
-        path: /tmp/cursor-latest.deb
+        path: /tmp/cursor.deb
         state: absent
+      when: not cursor_binary_stat.stat.exists
+
+    - name: "[cursor] Verify Cursor package is installed"
+      ansible.builtin.command:
+        cmd: dpkg -s cursor
+      register: cursor_package_status
+      changed_when: false
+      failed_when: false
+
+    - name: "[cursor] Verify Cursor binary exists"
+      ansible.builtin.stat:
+        path: /usr/bin/cursor
+      register: cursor_binary_verification
+
+    - name: "[cursor] Fail if Cursor installation is incomplete"
+      ansible.builtin.fail:
+        msg: >-
+          Cursor installation did not complete successfully.
+          API version: {{ cursor_expected_version | default('unknown') }}
+          Download URL: {{ cursor_deb_url | default('unknown') }}
+          Package rc: {{ cursor_package_status.rc | default('n/a') }}
+          Binary exists: {{ cursor_binary_verification.stat.exists | default(false) }}
+      when:
+        - cursor_package_status.rc != 0 or not cursor_binary_verification.stat.exists
+
+    - name: "[cursor] Report installed Cursor path"
+      ansible.builtin.debug:
+        msg: "✓ Cursor IDE installed at /usr/bin/cursor"
 
     # ==========================================================================
     # SECTION 12 — NODE.JS VIA NVM
