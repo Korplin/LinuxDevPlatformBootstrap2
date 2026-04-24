@@ -30,10 +30,9 @@
     kubectl_version: "v1.32"     # https://kubernetes.io/releases/
 
     # ── Cursor IDE download URL ──────────────────────────────────────────────
-    # ⚠️  VERIFY before running: open https://cursor.sh, click the Linux .deb
-    # download button and inspect the final URL. Update this variable if it
-    # differs. The playbook fails with a clear HTTP error if the URL is wrong.
-    cursor_deb_url: "https://download.cursor.sh/linux/installer/deb"
+    # Cursor metadata API — returns JSON containing debUrl, version, etc.
+    # The actual .deb download URL is extracted from the response in Section 11.
+    cursor_api_url: "https://cursor.com/api/download?platform=linux-x64&releaseTrack=stable"
 
   # ============================================================================
   # PRE-TASKS: sanity checks + variable resolution before the main task list
@@ -551,6 +550,13 @@
     # ==========================================================================
     # SECTION 11 — CURSOR IDE (.deb package)
     # ==========================================================================
+    # Cursor does not publish an apt repository. Their API endpoint returns a
+    # JSON object whose 'debUrl' field contains the versioned .deb download URL.
+    # Example response:
+    #   { "debUrl": "https://downloads.cursor.com/production/<sha>/...amd64.deb",
+    #     "version": "3.1.17", "commitSha": "...", ... }
+    # We resolve the URL at playbook runtime so we always get the latest release
+    # without hardcoding a version string that goes stale on the next release.
 
     - name: "[CURSOR] Check if Cursor is already installed"
       ansible.builtin.command:
@@ -558,33 +564,46 @@
       register: _cursor_dpkg
       changed_when: false
       failed_when: false
-      # Reason: dpkg-query returns exit code 1 if the package is not installed.
-      # We use this as an idempotency guard — download and install only when
-      # absent. To upgrade Cursor, run: sudo apt remove cursor && re-run playbook.
+      # Reason: Exit code 1 means not installed. We use this as the idempotency
+      # guard for all subsequent Cursor tasks. To upgrade Cursor:
+      #   sudo apt remove cursor && ansible-playbook /tmp/devplatform.yml
+
+    - name: "[CURSOR] Resolve latest .deb URL from Cursor API"
+      ansible.builtin.uri:
+        url: "{{ cursor_api_url }}"
+        method: GET
+        return_content: true
+        status_code: 200
+        headers:
+          Accept: "application/json"
+      register: _cursor_api
+      when: _cursor_dpkg.rc != 0 or 'install ok installed' not in _cursor_dpkg.stdout
+      # Reason: The API returns JSON containing debUrl, version, commitSha, etc.
+      # ansible.builtin.uri parses JSON automatically when Content-Type is
+      # application/json, making the field available as _cursor_api.json.debUrl.
 
     - name: "[CURSOR] Download Cursor .deb package"
       ansible.builtin.get_url:
-        url: "{{ cursor_deb_url }}"
+        url: "{{ _cursor_api.json.debUrl }}"
         dest: /tmp/cursor-latest.deb
         mode: "0644"
         force: true
-        timeout: 120
+        timeout: 180
       when: _cursor_dpkg.rc != 0 or 'install ok installed' not in _cursor_dpkg.stdout
-      # Reason: force: true ensures the latest version is always fetched when
-      # Cursor is not installed. The URL redirects to the current stable release.
-      # ⚠️  If this task fails with HTTP 404, verify cursor_deb_url in vars.
+      # Reason: Using the resolved CDN URL (not the API endpoint) as the download
+      # target avoids any redirect chains and ensures we get exactly the version
+      # the API advertised.
 
     - name: "[CURSOR] Install Cursor .deb package"
       ansible.builtin.apt:
         deb: /tmp/cursor-latest.deb
         state: present
       when: _cursor_dpkg.rc != 0 or 'install ok installed' not in _cursor_dpkg.stdout
-      # Reason: ansible.builtin.apt with deb: installs a local .deb file using
-      # dpkg, registers it in the apt database, and resolves dependencies.
-      # This is the correct way to install a .deb that has no apt repository.
+      # Reason: ansible.builtin.apt with deb: installs via dpkg, registers the
+      # package in the apt database, and resolves any declared dependencies.
       # Using .deb instead of AppImage means:
       #   - No libfuse2 dependency
-      #   - No --no-sandbox workaround (sandbox works correctly with .deb)
+      #   - No --no-sandbox workaround needed (sandbox works correctly)
       #   - Proper system-wide installation under /usr/
       #   - Registered in dpkg — 'apt remove cursor' works cleanly
 
@@ -592,8 +611,6 @@
       ansible.builtin.file:
         path: /tmp/cursor-latest.deb
         state: absent
-      # Reason: The .deb file is only needed for installation. Removing it
-      # keeps /tmp clean and prevents a stale file from confusing future runs.
 
     # ==========================================================================
     # SECTION 12 — NODE.JS VIA NVM
