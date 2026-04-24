@@ -3,12 +3,13 @@
 # devplatform.yml
 # Linux Developer Platform Bootstrap — Stage 2
 #
-# Repository : https://github.com/Korplin/LinuxDevPlatformBootstrap
+# Repository : https://github.com/Korplin/LinuxDevPlatformBootstrap2
 # Target OS  : Debian 13 "trixie" amd64
-# Run with   : ansible-playbook -K /tmp/devplatform.yml
+# Run with   : ansible-playbook /tmp/devplatform.yml
+#              (invoked automatically by devplatformbootstrap.sh)
 #
 # All tasks use ansible.builtin.* fully-qualified module names.
-# The playbook is idempotent: every task is safe to run multiple times.
+# The playbook is idempotent — every task is safe to run multiple times.
 # =============================================================================
 
 - name: Linux Developer Platform Bootstrap
@@ -19,22 +20,27 @@
 
   vars:
     # ── Real (non-root) user detection ──────────────────────────────────────
-    # When the bootstrap script runs via sudo, SUDO_USER is set by sudo to the
-    # original caller's username. We use this to install per-user tools
-    # (nvm, oh-my-zsh, pipx tools) into the correct home directory.
+    # When the bootstrap script runs via sudo, SUDO_USER is set to the
+    # original caller's username. real_home is NOT hardcoded here; it is
+    # resolved authoritatively from /etc/passwd in pre_tasks below.
     real_user: "{{ ansible_env.SUDO_USER | default(ansible_user_id) }}"
-    real_home: "/home/{{ ansible_env.SUDO_USER | default(ansible_user_id) }}"
 
-    # Pinned versions — bump here to update
-    nvm_version: "v0.40.1"       # https://github.com/nvm-sh/nvm/releases
+    # ── Pinned versions — bump here to update ───────────────────────────────
+    nvm_version:     "v0.40.1"   # https://github.com/nvm-sh/nvm/releases
     kubectl_version: "v1.32"     # https://kubernetes.io/releases/
 
+    # ── Cursor IDE download URL ──────────────────────────────────────────────
+    # ⚠️  VERIFY before running: open https://cursor.sh, click the Linux .deb
+    # download button and inspect the final URL. Update this variable if it
+    # differs. The playbook fails with a clear HTTP error if the URL is wrong.
+    cursor_deb_url: "https://download.cursor.sh/linux/installer/deb"
+
   # ============================================================================
-  # PRE-TASKS: sanity checks before the main task list begins
+  # PRE-TASKS: sanity checks + variable resolution before the main task list
   # ============================================================================
   pre_tasks:
 
-    - name: "[PRE] Assert that target is Debian 13 trixie"
+    - name: "[PRE] Assert target is Debian 13 trixie"
       ansible.builtin.assert:
         that:
           - ansible_distribution == "Debian"
@@ -44,11 +50,36 @@
           Detected: {{ ansible_distribution }} {{ ansible_distribution_release }}.
         success_msg: "Confirmed: Debian 13 (trixie)"
       # Reason: Hard-fail immediately if the OS is wrong rather than silently
-      # corrupting a non-trixie system with trixie-specific APT sources.
+      # applying trixie-specific APT sources to an incompatible system.
 
-    - name: "[PRE] Show real_user that will receive per-user configuration"
+    - name: "[PRE] Resolve real_home from the passwd database"
+      ansible.builtin.command:
+        cmd: "getent passwd {{ real_user }}"
+      register: _passwd_entry
+      changed_when: false
+      failed_when: _passwd_entry.rc != 0
+      # Reason: getent reads /etc/passwd authoritatively and handles any home
+      # directory location — /home/x, /root, /data/users/x, etc. Hardcoding
+      # "/home/{{ real_user }}" breaks for root and any custom home path.
+
+    - name: "[PRE] Set real_home fact from passwd entry"
+      ansible.builtin.set_fact:
+        real_home: "{{ _passwd_entry.stdout.split(':')[5] }}"
+      # Reason: The 6th colon-delimited field (index 5) of /etc/passwd is the
+      # home directory — this is authoritative and platform-independent.
+
+    - name: "[PRE] Display configuration summary"
       ansible.builtin.debug:
-        msg: "Per-user configuration target: '{{ real_user }}' (home: {{ real_home }})"
+        msg:
+          - "real_user : {{ real_user }}"
+          - "real_home : {{ real_home }}"
+
+  # ============================================================================
+  handlers:
+    - name: Restart ssh
+      ansible.builtin.systemd:
+        name: ssh
+        state: restarted
 
   # ============================================================================
   tasks:
@@ -57,7 +88,7 @@
     # SECTION 1 — APT SOURCES
     # ==========================================================================
 
-    - name: "[APT] Write /etc/apt/sources.list with contrib, non-free, non-free-firmware"
+    - name: "[APT] Write /etc/apt/sources.list"
       ansible.builtin.copy:
         dest: /etc/apt/sources.list
         owner: root
@@ -65,22 +96,19 @@
         mode: "0644"
         content: |
           # Debian 13 (trixie) — managed by Ansible (devplatform.yml)
-          # Main repository
           deb http://deb.debian.org/debian trixie main contrib non-free non-free-firmware
           deb-src http://deb.debian.org/debian trixie main contrib non-free non-free-firmware
 
-          # Security updates
           deb http://security.debian.org/debian-security trixie-security main contrib non-free non-free-firmware
           deb-src http://security.debian.org/debian-security trixie-security main contrib non-free non-free-firmware
 
-          # Stable point-release updates
           deb http://deb.debian.org/debian trixie-updates main contrib non-free non-free-firmware
           deb-src http://deb.debian.org/debian trixie-updates main contrib non-free non-free-firmware
-      # Reason: Starting with Debian 12, non-free-firmware is a separate
-      # component from non-free. Both must be listed explicitly to get
-      # proprietary GPU drivers (non-free) AND hardware firmware blobs
-      # such as wifi and microcode (non-free-firmware). contrib contains
-      # packages that depend on non-free software.
+      # Reason: Since Debian 12, non-free-firmware is a separate component.
+      # Both non-free AND non-free-firmware must be listed to get proprietary
+      # GPU drivers (non-free) AND hardware firmware blobs like WiFi and CPU
+      # microcode (non-free-firmware). contrib contains packages that depend
+      # on non-free software.
 
     - name: "[APT] Create /etc/apt/keyrings directory"
       ansible.builtin.file:
@@ -89,17 +117,15 @@
         owner: root
         group: root
         mode: "0755"
-      # Reason: /etc/apt/keyrings is the Debian 12+ recommended directory for
-      # per-repository GPG keys. The signed-by= apt option references files
-      # here, providing better security than the old apt-key approach.
+      # Reason: /etc/apt/keyrings is the Debian 12+ standard location for
+      # per-repository GPG keys used with the signed-by= apt option.
 
     - name: "[APT] Refresh package cache after sources.list update"
       ansible.builtin.apt:
         update_cache: true
         cache_valid_time: 0
-      # Reason: cache_valid_time: 0 forces a full refresh. We must do this
-      # immediately after writing sources.list, otherwise subsequent apt tasks
-      # may operate on a stale cache that does not include the new components.
+      # Reason: cache_valid_time: 0 forces a full refresh immediately after
+      # writing sources.list so subsequent tasks see the new components.
 
     # ==========================================================================
     # SECTION 2 — VM AND GPU DETECTION
@@ -108,8 +134,8 @@
     - name: "[DETECT] Install dmidecode and pciutils"
       ansible.builtin.apt:
         name:
-          - dmidecode    # reads SMBIOS/DMI data for VM detection
-          - pciutils     # provides lspci for GPU detection
+          - dmidecode   # reads SMBIOS/DMI data for VM detection
+          - pciutils    # provides lspci for GPU detection
         state: present
 
     - name: "[DETECT] Query system product name"
@@ -118,8 +144,6 @@
       register: _system_product
       changed_when: false
       failed_when: false
-      # Reason: system-product-name returns "VirtualBox" on VirtualBox VMs
-      # and "Standard PC (Q35...)" or similar on QEMU/KVM guests.
 
     - name: "[DETECT] Query system manufacturer"
       ansible.builtin.shell:
@@ -127,9 +151,6 @@
       register: _system_manufacturer
       changed_when: false
       failed_when: false
-      # Reason: KVM/QEMU guests report "QEMU" as the manufacturer even though
-      # the product name does not contain "QEMU". Checking both gives reliable
-      # detection across different hypervisor configurations.
 
     - name: "[DETECT] Query VGA adapter via lspci"
       ansible.builtin.shell:
@@ -137,9 +158,6 @@
       register: _gpu_info
       changed_when: false
       failed_when: false
-      # Reason: lspci | grep -i vga prints the graphics adapter line which
-      # includes the vendor name (NVIDIA, AMD, Intel). We uppercase the output
-      # in the set_fact below to simplify string matching.
 
     - name: "[DETECT] Derive platform and GPU boolean facts"
       ansible.builtin.set_fact:
@@ -163,14 +181,14 @@
     - name: "[DETECT] Print detection summary"
       ansible.builtin.debug:
         msg:
-          - "Product    : {{ _system_product.stdout | trim }}"
-          - "Manufacturer: {{ _system_manufacturer.stdout | trim }}"
-          - "GPU line   : {{ _gpu_info.stdout | trim }}"
-          - "VirtualBox : {{ is_virtualbox }}"
-          - "KVM/QEMU   : {{ is_kvm }}"
-          - "NVIDIA GPU : {{ has_nvidia }}"
-          - "AMD GPU    : {{ has_amd }}"
-          - "Intel GPU  : {{ has_intel_gpu }}"
+          - "Product      : {{ _system_product.stdout | trim }}"
+          - "Manufacturer : {{ _system_manufacturer.stdout | trim }}"
+          - "GPU line     : {{ _gpu_info.stdout | trim }}"
+          - "VirtualBox   : {{ is_virtualbox }}"
+          - "KVM/QEMU     : {{ is_kvm }}"
+          - "NVIDIA GPU   : {{ has_nvidia }}"
+          - "AMD GPU      : {{ has_amd }}"
+          - "Intel GPU    : {{ has_intel_gpu }}"
 
     # ==========================================================================
     # SECTION 3 — GPU AND VIRTUALISATION DRIVERS
@@ -184,21 +202,29 @@
         state: present
       when: is_virtualbox
       # Reason: VirtualBox guest additions enable seamless mouse, shared
-      # clipboard, dynamic screen resolution, and accelerated display inside
-      # a VirtualBox VM. Physical GPU driver tasks are skipped when detected.
+      # clipboard, dynamic screen resolution, and accelerated display.
+      # Physical GPU driver tasks are skipped when running inside VirtualBox.
 
     - name: "[GPU] Install KVM/QEMU guest utilities"
       ansible.builtin.apt:
         name:
-          - spice-vdagent            # copy-paste and auto-resize in SPICE sessions
+          - spice-vdagent            # clipboard and auto-resize in SPICE sessions
           - qemu-guest-agent         # host↔guest communication channel
-          - xserver-xorg-video-qxl   # QXL display driver for QEMU video card
+          - xserver-xorg-video-qxl   # QXL display driver for QEMU virtual GPU
         state: present
       when: is_kvm and not is_virtualbox
-      # Reason: spice-vdagent provides clipboard integration in Virt-Manager
-      # and other SPICE clients. qemu-guest-agent allows host commands such as
-      # graceful shutdown. xserver-xorg-video-qxl is required for the QXL
-      # virtual GPU that QEMU presents by default.
+
+    - name: "[GPU] Install linux kernel headers (required for NVIDIA DKMS)"
+      ansible.builtin.apt:
+        name:
+          - linux-headers-amd64   # metapackage — always tracks the running kernel
+        state: present
+      when: has_nvidia and not is_virtualbox and not is_kvm
+      # Reason: The proprietary NVIDIA driver uses DKMS to compile a kernel
+      # module against the running kernel. Without the matching headers, DKMS
+      # compilation fails silently — the system boots but NVIDIA is not loaded.
+      # linux-headers-amd64 is a metapackage that always depends on the current
+      # kernel's headers, so it remains correct after kernel upgrades.
 
     - name: "[GPU] Install NVIDIA proprietary driver"
       ansible.builtin.apt:
@@ -210,8 +236,8 @@
       register: _nvidia_install
       ignore_errors: true
       # Reason: nvidia-driver lives in non-free. ignore_errors: true prevents
-      # a hard failure if a matching DKMS build is not available for the
-      # running kernel; the nouveau blacklist task below only fires on success.
+      # a hard failure if a DKMS build is unavailable for the running kernel;
+      # the nouveau blacklist task below only fires on a successful install.
 
     - name: "[GPU] Blacklist nouveau (open-source NVIDIA driver)"
       ansible.builtin.copy:
@@ -221,7 +247,6 @@
         mode: "0644"
         content: |
           # Managed by devplatform.yml — do not edit manually.
-          # nouveau conflicts with the proprietary nvidia-driver.
           blacklist nouveau
           options nouveau modeset=0
       when:
@@ -230,32 +255,26 @@
         - not is_kvm
         - _nvidia_install is defined
         - _nvidia_install is succeeded
-      # Reason: The proprietary NVIDIA driver and the open-source nouveau driver
-      # cannot be loaded simultaneously. This modprobe configuration prevents
-      # the kernel from loading nouveau at boot, which is required for the
-      # proprietary driver to initialise correctly.
+      # Reason: The proprietary NVIDIA driver and the open-source nouveau
+      # driver cannot coexist. This modprobe rule prevents the kernel from
+      # loading nouveau at boot, which is required for nvidia-driver to init.
 
     - name: "[GPU] Install AMD GPU driver packages"
       ansible.builtin.apt:
         name:
           - firmware-amd-graphics        # GPU firmware blobs (required for amdgpu)
           - libgl1-mesa-dri              # OpenGL via Mesa (radeonsi driver)
-          - xserver-xorg-video-amdgpu    # Xorg DDX driver for AMD graphics
+          - xserver-xorg-video-amdgpu    # Xorg DDX driver for AMD
         state: present
       when: has_amd and not is_virtualbox and not is_kvm
-      # Reason: The amdgpu kernel driver requires firmware-amd-graphics to
-      # initialise modern AMD GPUs. libgl1-mesa-dri provides the OpenGL stack.
-      # xserver-xorg-video-amdgpu provides modesetting acceleration in Xorg.
 
     - name: "[GPU] Install Intel GPU driver packages"
       ansible.builtin.apt:
         name:
-          - intel-media-va-driver   # VA-API hardware video acceleration
+          - intel-media-va-driver   # VA-API hardware video acceleration (Gen8+)
           - libgl1-mesa-dri         # OpenGL via Mesa (iris / i965 driver)
         state: present
       when: has_intel_gpu and not is_virtualbox and not is_kvm
-      # Reason: intel-media-va-driver enables hardware decode/encode for
-      # modern Intel iGPUs (Gen8+). libgl1-mesa-dri is the OpenGL provider.
 
     # ==========================================================================
     # SECTION 4 — WIRELESS AND HARDWARE FIRMWARE
@@ -264,36 +283,32 @@
     - name: "[FIRMWARE] Install wireless and general hardware firmware"
       ansible.builtin.apt:
         name:
-          - firmware-linux          # generic Linux firmware bundle
-          - firmware-linux-nonfree  # additional non-free firmware (GPU, etc.)
-          - firmware-iwlwifi        # Intel WiFi (AX200, AX210, 8260, 8265…)
-          - firmware-realtek        # Realtek NICs and WiFi adapters
-          - firmware-atheros        # Qualcomm/Atheros WiFi
-          - firmware-brcm80211      # Broadcom WiFi (common in ThinkPads, MBP)
+          - firmware-linux           # generic Linux firmware bundle
+          - firmware-linux-nonfree   # additional non-free firmware
+          - firmware-iwlwifi         # Intel WiFi (AX200, AX210, 8260, 8265…)
+          - firmware-realtek         # Realtek NICs and WiFi adapters
+          - firmware-atheros         # Qualcomm/Atheros WiFi
+          - firmware-brcm80211       # Broadcom WiFi (common in ThinkPads)
         state: present
       # Reason: A developer workstation may be on any hardware. Shipping all
-      # common wifi firmware ensures the system is usable on bare metal without
-      # a separate post-install step. Unnecessary firmware packages do no harm.
+      # common WiFi firmware ensures the system is usable on bare metal without
+      # a separate post-install step. Unused firmware packages are harmless.
 
     # ==========================================================================
     # SECTION 5 — KDE PLASMA DESKTOP
     # ==========================================================================
 
-    - name: "[KDE] Install KDE Plasma, SDDM, plasma-nm, konsole, and Powerline fonts"
+    - name: "[KDE] Install KDE Plasma, SDDM, and core KDE applications"
       ansible.builtin.apt:
         name:
-          - kde-full                 # complete KDE Plasma metapackage
-          - sddm                     # Simple Desktop Display Manager for KDE
-          - plasma-nm                # NetworkManager applet for KDE Plasma
-          - konsole                  # KDE terminal emulator
-          - fonts-powerline          # required for agnoster zsh theme glyphs
+          - kde-full                          # complete KDE Plasma metapackage
+          - sddm                              # Simple Desktop Display Manager
+          - plasma-nm                         # NetworkManager applet for KDE
+          - konsole                           # KDE terminal emulator
+          - fonts-powerline                   # required for agnoster zsh theme
+          - fonts-firacode                    # developer font with ligatures
         state: present
         install_recommends: true
-      # Reason: kde-full pulls in the full KDE application suite including
-      # Dolphin, Kate, Spectacle, KCalc, etc. plasma-nm provides the system
-      # tray widget for managing wired and wireless connections via
-      # NetworkManager. SDDM is the officially recommended display manager for
-      # KDE Plasma; it reads /etc/sddm.conf.d/ for theming configuration.
 
     - name: "[KDE] Register sddm as the default display manager via debconf"
       ansible.builtin.debconf:
@@ -301,10 +316,9 @@
         question: shared/default-x-display-manager
         value: sddm
         vtype: select
-      # Reason: On Debian, the active display manager is tracked via debconf.
-      # If multiple DMs are installed as dependencies (e.g., gdm3 from a GNOME
-      # library), this selection ensures sddm wins. The update-alternatives
-      # system reads this setting via dpkg-reconfigure.
+      # Reason: If multiple DMs are installed as indirect dependencies (e.g.,
+      # gdm3 pulled in via a GNOME library), this debconf selection ensures
+      # sddm wins and is used at next boot.
 
     - name: "[KDE] Create /etc/sddm.conf.d/ directory"
       ansible.builtin.file:
@@ -327,17 +341,14 @@
 
           [Autologin]
           Relogin=false
-      # Reason: Breeze is the default KDE theme for sddm. Disabling Relogin
-      # is a sensible security default for a developer workstation.
 
-    - name: "[KDE] Enable sddm service (starts at next boot)"
+    - name: "[KDE] Enable sddm service"
       ansible.builtin.systemd:
         name: sddm
         enabled: true
         daemon_reload: true
-      # Reason: We enable (not start) sddm here because the Xorg/Wayland
-      # display server cannot be started from within an Ansible task. It will
-      # start automatically after the required reboot.
+      # Reason: We enable (not start) sddm here because the display server
+      # cannot start inside an Ansible session. It starts after reboot.
 
     # ==========================================================================
     # SECTION 6 — GIT AND GIT TOOLING
@@ -351,9 +362,8 @@
         group: root
         mode: "0644"
         force: false
-      # Reason: force: false means the key is only downloaded if the file does
-      # not already exist. Subsequent playbook runs skip this network request,
-      # making the task idempotent and faster on re-runs.
+      # Reason: force: false — the key is only downloaded if absent. Subsequent
+      # runs skip the network request, making the task faster and idempotent.
 
     - name: "[GIT] Add GitHub CLI apt repository"
       ansible.builtin.apt_repository:
@@ -370,40 +380,51 @@
         name:
           - git          # core VCS
           - git-lfs      # Large File Storage extension
-          - git-flow     # Vincent Driessen branching model commands
           - tig          # ncurses text-mode repository browser
-          - gitk         # Tcl/Tk GUI history browser
-          - gh           # official GitHub CLI from cli.github.com repo
+          - gitk         # Tcl/Tk GUI history viewer
+          - gh           # official GitHub CLI
+          - meld         # visual diff and merge tool
         state: present
+      # Reason: git-flow is intentionally excluded. This platform uses
+      # trunk-based development. git-flow is covered as historical context
+      # in Module 1 but is not installed — tools shape habits.
 
     - name: "[GIT] Initialise git-lfs system-wide"
       ansible.builtin.command:
         cmd: git lfs install --system
       changed_when: false
-      # Reason: git lfs install --system writes smudge/clean filter hooks and
-      # an lfs section to /etc/gitconfig. changed_when: false suppresses false
-      # "changed" reports because git lfs install is always idempotent.
 
     - name: "[GIT] Set system-wide git config: core.autocrlf = input"
       ansible.builtin.command:
         cmd: git config --system core.autocrlf input
       changed_when: false
-      # Reason: On Linux, input converts CRLF → LF on commit but never adds
-      # CRLF to checked-out files. This is the correct setting for Linux
-      # developers collaborating with Windows contributors.
+      # Reason: 'input' converts CRLF → LF on commit but never adds CRLF to
+      # checked-out files. Correct for Linux developers working with Windows
+      # contributors.
 
     - name: "[GIT] Set system-wide git config: init.defaultBranch = main"
       ansible.builtin.command:
         cmd: git config --system init.defaultBranch main
       changed_when: false
 
-    - name: "[GIT] Set system-wide git config: pull.rebase = false"
+    - name: "[GIT] Set system-wide git config: pull.rebase = true"
       ansible.builtin.command:
-        cmd: git config --system pull.rebase false
+        cmd: git config --system pull.rebase true
       changed_when: false
-      # Reason: pull.rebase = false makes git pull use a merge commit instead
-      # of rebasing. This is the historical default and avoids surprising
-      # novice users who may not understand rebasing semantics.
+      # Reason: trunk-based development produces a linear commit history.
+      # pull.rebase = true keeps that history linear when pulling — it rebases
+      # local commits on top of the fetched remote state instead of creating
+      # a merge commit. This is the correct default for the branching strategy
+      # taught in Module 1.
+
+    - name: "[GIT] Set system-wide git config: rebase.autoStash = true"
+      ansible.builtin.command:
+        cmd: git config --system rebase.autoStash true
+      changed_when: false
+      # Reason: autoStash automatically stashes uncommitted changes before a
+      # rebase and restores them after. This prevents the common beginner error
+      # "cannot rebase: you have unstaged changes" when running git pull with
+      # rebase enabled.
 
     # ==========================================================================
     # SECTION 7 — KVM VIRTUALISATION STACK
@@ -421,28 +442,26 @@
           - bridge-utils             # brctl for network bridging
           - ovmf                     # UEFI firmware for QEMU VMs
         state: present
-      # Reason: ovmf provides TianoCore UEFI firmware, required to install
-      # modern operating systems (Windows 11, Fedora with Secure Boot) inside
-      # KVM guests. bridge-utils enables bridged networking for VMs so they
-      # appear on the same network segment as the host.
+      # Reason: ovmf (TianoCore UEFI) is required to install modern OSes
+      # (Windows 11, Fedora with Secure Boot) inside KVM guests.
 
     - name: "[KVM] Add {{ real_user }} to libvirt group"
       ansible.builtin.user:
         name: "{{ real_user }}"
         groups: libvirt
         append: true
-      # Reason: Without libvirt group membership, the user receives
-      # "permission denied" when connecting to the libvirt socket. append: true
-      # is critical — omitting it would remove the user from all other groups.
+      # Reason: Without libvirt membership, the user gets "permission denied"
+      # connecting to the libvirt socket. append: true is critical — omitting
+      # it would remove the user from all other groups.
 
     - name: "[KVM] Add {{ real_user }} to kvm group"
       ansible.builtin.user:
         name: "{{ real_user }}"
         groups: kvm
         append: true
-      # Reason: The kvm group grants read/write access to /dev/kvm, the
-      # kernel virtualisation device. Without it, hardware acceleration is
-      # unavailable and VMs run entirely in software emulation (very slow).
+      # Reason: The kvm group grants r/w access to /dev/kvm. Without it,
+      # hardware acceleration is unavailable and VMs run in pure software
+      # emulation, which is extremely slow.
 
     - name: "[KVM] Enable and start libvirtd service"
       ansible.builtin.systemd:
@@ -457,22 +476,15 @@
     - name: "[FLATPAK] Install Flatpak and KDE Discover Flatpak backend"
       ansible.builtin.apt:
         name:
-          - flatpak                          # Flatpak runtime and CLI
-          - plasma-discover-backend-flatpak  # Flatpak integration in KDE Discover
+          - flatpak
+          - plasma-discover-backend-flatpak   # Flatpak integration in Discover
         state: present
-      # Reason: plasma-discover-backend-flatpak integrates Flatpak into KDE's
-      # graphical software centre (Discover), so students can browse and install
-      # Flatpak apps without using the terminal.
 
-    - name: "[FLATPAK] Add Flathub remote repository"
+    - name: "[FLATPAK] Add Flathub remote"
       ansible.builtin.command:
-        cmd: >
-          flatpak remote-add --if-not-exists
-          flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+        cmd: flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
       changed_when: false
-      # Reason: --if-not-exists is the Flatpak-native idempotency guard; if
-      # flathub is already registered this is a silent no-op. changed_when: false
-      # suppresses spurious "changed" output on subsequent runs.
+      # Reason: --if-not-exists is Flatpak's own idempotency guard.
 
     # ==========================================================================
     # SECTION 9 — BRAVE BROWSER
@@ -486,8 +498,6 @@
         group: root
         mode: "0644"
         force: false
-      # Reason: Brave publishes a pre-dearmored .gpg key. force: false makes
-      # the download idempotent; the key is only re-fetched if absent.
 
     - name: "[BRAVE] Add Brave Browser apt repository"
       ansible.builtin.apt_repository:
@@ -507,14 +517,12 @@
     # SECTION 10 — VISUAL STUDIO CODE
     # ==========================================================================
 
-    - name: "[VSCODE] Download Microsoft GPG key (ASCII-armored)"
+    - name: "[VSCODE] Download Microsoft GPG key"
       ansible.builtin.get_url:
         url: https://packages.microsoft.com/keys/microsoft.asc
         dest: /tmp/microsoft.asc
         mode: "0644"
         force: true
-      # Reason: force: true fetches a fresh copy each time. The .asc file is
-      # ASCII-armored and must be dearmored to binary before apt can use it.
 
     - name: "[VSCODE] Dearmor Microsoft GPG key into /etc/apt/keyrings/"
       ansible.builtin.shell:
@@ -522,9 +530,8 @@
           gpg --dearmor < /tmp/microsoft.asc
           > /etc/apt/keyrings/packages.microsoft.gpg
         creates: /etc/apt/keyrings/packages.microsoft.gpg
-      # Reason: apt's signed-by= option requires a binary .gpg key file, not
-      # an ASCII .asc file. The creates: guard prevents re-running if the
-      # binary key already exists, making this task idempotent.
+      # Reason: apt's signed-by= requires a binary .gpg key, not ASCII .asc.
+      # creates: skips the dearmor if the binary key already exists.
 
     - name: "[VSCODE] Add Visual Studio Code apt repository"
       ansible.builtin.apt_repository:
@@ -536,72 +543,63 @@
         filename: vscode
         update_cache: true
 
-    - name: "[VSCODE] Install Visual Studio Code (.deb, not Flatpak or snap)"
+    - name: "[VSCODE] Install Visual Studio Code"
       ansible.builtin.apt:
         name: code
         state: present
 
     # ==========================================================================
-    # SECTION 11 — CURSOR IDE (AppImage)
+    # SECTION 11 — CURSOR IDE (.deb package)
     # ==========================================================================
 
-    - name: "[CURSOR] Install libfuse2 (FUSE2 compatibility for AppImages)"
-      ansible.builtin.apt:
-        name: libfuse2
-        state: present
-      # Reason: Debian 12+ ships libfuse3 by default. Most AppImages — including
-      # Cursor — are built against the older FUSE2 ABI and require libfuse2
-      # to mount themselves at runtime. Both versions coexist without conflict.
+    - name: "[CURSOR] Check if Cursor is already installed"
+      ansible.builtin.command:
+        cmd: dpkg-query -W -f='${Status}' cursor
+      register: _cursor_dpkg
+      changed_when: false
+      failed_when: false
+      # Reason: dpkg-query returns exit code 1 if the package is not installed.
+      # We use this as an idempotency guard — download and install only when
+      # absent. To upgrade Cursor, run: sudo apt remove cursor && re-run playbook.
 
-    - name: "[CURSOR] Create /opt/cursor directory"
-      ansible.builtin.file:
-        path: /opt/cursor
-        state: directory
-        owner: root
-        group: root
-        mode: "0755"
-
-    - name: "[CURSOR] Download latest Cursor AppImage"
+    - name: "[CURSOR] Download Cursor .deb package"
       ansible.builtin.get_url:
-        url: https://download.cursor.sh/linux/appImage/x64
-        dest: /opt/cursor/cursor.AppImage
-        owner: root
-        group: root
-        mode: "0755"
-        force: false
-      # Reason: The Cursor download URL always redirects to the latest stable
-      # release. force: false ensures the file is only downloaded if absent;
-      # delete /opt/cursor/cursor.AppImage and re-run to upgrade Cursor.
-
-    - name: "[CURSOR] Create Cursor .desktop entry for KDE application menu"
-      ansible.builtin.copy:
-        dest: /usr/share/applications/cursor.desktop
-        owner: root
-        group: root
+        url: "{{ cursor_deb_url }}"
+        dest: /tmp/cursor-latest.deb
         mode: "0644"
-        content: |
-          [Desktop Entry]
-          Version=1.0
-          Name=Cursor
-          Comment=AI-powered Code Editor built on VS Code
-          Exec=/opt/cursor/cursor.AppImage --no-sandbox %F
-          Icon=code
-          Type=Application
-          Categories=Development;IDE;TextEditor;
-          Terminal=false
-          StartupWMClass=Cursor
-          MimeType=text/plain;inode/directory;
-      # Reason: The .desktop file registers Cursor in the KDE (freedesktop.org-
-      # compliant) application launcher. --no-sandbox is required for AppImages
-      # on systems where user namespaces are restricted (the default on Debian).
-      # Icon=code reuses VS Code's installed icon since Cursor does not install
-      # a system icon; this gives a recognisable icon in the app menu.
+        force: true
+        timeout: 120
+      when: _cursor_dpkg.rc != 0 or 'install ok installed' not in _cursor_dpkg.stdout
+      # Reason: force: true ensures the latest version is always fetched when
+      # Cursor is not installed. The URL redirects to the current stable release.
+      # ⚠️  If this task fails with HTTP 404, verify cursor_deb_url in vars.
+
+    - name: "[CURSOR] Install Cursor .deb package"
+      ansible.builtin.apt:
+        deb: /tmp/cursor-latest.deb
+        state: present
+      when: _cursor_dpkg.rc != 0 or 'install ok installed' not in _cursor_dpkg.stdout
+      # Reason: ansible.builtin.apt with deb: installs a local .deb file using
+      # dpkg, registers it in the apt database, and resolves dependencies.
+      # This is the correct way to install a .deb that has no apt repository.
+      # Using .deb instead of AppImage means:
+      #   - No libfuse2 dependency
+      #   - No --no-sandbox workaround (sandbox works correctly with .deb)
+      #   - Proper system-wide installation under /usr/
+      #   - Registered in dpkg — 'apt remove cursor' works cleanly
+
+    - name: "[CURSOR] Remove downloaded .deb package"
+      ansible.builtin.file:
+        path: /tmp/cursor-latest.deb
+        state: absent
+      # Reason: The .deb file is only needed for installation. Removing it
+      # keeps /tmp clean and prevents a stale file from confusing future runs.
 
     # ==========================================================================
     # SECTION 12 — NODE.JS VIA NVM
     # ==========================================================================
 
-    - name: "[NVM] Check if nvm is already installed for {{ real_user }}"
+    - name: "[NVM] Check if nvm is already installed"
       ansible.builtin.stat:
         path: "{{ real_home }}/.nvm/nvm.sh"
       register: _nvm_stat
@@ -619,11 +617,11 @@
       environment:
         HOME: "{{ real_home }}"
         NVM_DIR: "{{ real_home }}/.nvm"
-      # Reason: nvm is a shell function, not a binary, and must be installed
-      # per-user. We use become_user so the install script writes ~/.nvm into
-      # the real user's home directory instead of /root. The install script
-      # automatically appends init lines to ~/.bashrc; we add them to ~/.zshrc
-      # manually in the Shell section below.
+      # Reason: nvm is a shell function, not a binary — it must be installed
+      # per-user. become_user ensures ~/.nvm lands in the real user's home.
+      # RUNZSH and CHSH are not set here because we handle .zshrc integration
+      # explicitly in the Shell section, which is more reliable than letting
+      # the nvm installer append to files we also manage.
 
     - name: "[NVM] Install latest Node.js LTS via nvm"
       ansible.builtin.shell: |
@@ -640,9 +638,6 @@
         NVM_DIR: "{{ real_home }}/.nvm"
       register: _nvm_node_install
       changed_when: "'already installed' not in _nvm_node_install.stdout"
-      # Reason: nvm.sh must be sourced because nvm is a shell function, not a
-      # binary in PATH. nvm alias default node makes the LTS version active in
-      # all new shell sessions without requiring 'nvm use' manually.
 
     - name: "[NVM] Install global npm packages"
       ansible.builtin.shell: |
@@ -657,10 +652,9 @@
         HOME: "{{ real_home }}"
         NVM_DIR: "{{ real_home }}/.nvm"
       changed_when: false
-      # Reason: These global packages are installed into the nvm-managed Node
-      # prefix (not the system npm), so they stay isolated and are updated when
-      # Node.js itself is updated via nvm. changed_when: false suppresses false
-      # "changed" output because npm install -g always outputs something.
+      # Reason: These global packages install into the nvm-managed Node prefix,
+      # not the system npm, so they stay isolated and are updated when Node is
+      # updated via nvm. changed_when: false suppresses always-changed output.
 
     # ==========================================================================
     # SECTION 13 — PYTHON AND TOOLING
@@ -675,11 +669,12 @@
           - python3-dev    # C header files for building Python extensions
           - pipx           # isolated application installer (PEP 668-safe)
         state: present
-      # Reason: python3-dev is required to compile C extension modules (e.g.,
-      # cryptography, psycopg2). pipx installs CLI tools in isolated virtualenvs,
-      # respecting PEP 668 which prevents pip from modifying the system Python.
+      # Reason: python3-dev is required to compile C extension modules
+      # (cryptography, psycopg2, etc.). pipx installs CLI tools in isolated
+      # virtualenvs, respecting PEP 668 which prevents pip from modifying
+      # the system Python installation.
 
-    - name: "[PYTHON] Ensure ~/.local/bin is on PATH in {{ real_user }}'s .profile"
+    - name: "[PYTHON] Ensure ~/.local/bin is on PATH in .profile"
       ansible.builtin.lineinfile:
         path: "{{ real_home }}/.profile"
         line: 'export PATH="$HOME/.local/bin:$PATH"'
@@ -688,9 +683,6 @@
         mode: "0644"
       become: true
       become_user: "{{ real_user }}"
-      # Reason: pipx installs tool binaries to ~/.local/bin. This path is
-      # not guaranteed to be in PATH on a minimal Debian install. .profile is
-      # sourced by login shells (bash, zsh with oh-my-zsh).
 
     - name: "[PYTHON] Install ansible-lint via pipx"
       ansible.builtin.command:
@@ -702,9 +694,6 @@
         HOME: "{{ real_home }}"
         PIPX_HOME: "{{ real_home }}/.local/pipx"
         PIPX_BIN_DIR: "{{ real_home }}/.local/bin"
-      # Reason: creates: points to the pipx virtualenv directory. If the
-      # directory already exists, Ansible skips the task — a reliable and
-      # cheap idempotency check that avoids calling 'pipx list'.
 
     - name: "[PYTHON] Install pre-commit via pipx"
       ansible.builtin.command:
@@ -742,12 +731,11 @@
       when: not _uv_stat.stat.exists
       environment:
         HOME: "{{ real_home }}"
-      # Reason: uv is not yet packaged in Debian trixie. The official installer
-      # downloads a static binary and places it at ~/.local/bin/uv. We check
-      # for the binary first (via stat) so the task is skipped on re-runs.
+      # Reason: uv is not yet in Debian trixie. The official installer places
+      # a static binary at ~/.local/bin/uv. The stat check makes this idempotent.
 
     # ==========================================================================
-    # SECTION 14 — CORE DEVOPS UTILITIES
+    # SECTION 14 — CORE DEVOPS UTILITIES (apt packages)
     # ==========================================================================
 
     - name: "[DEVOPS] Install core DevOps utility packages"
@@ -756,39 +744,52 @@
           # ── File and data utilities ──────────────────────────────────────
           - curl
           - wget
-          - jq           # JSON processor
-          - yq           # YAML/XML/TOML processor (Python wrapper for jq)
+          - jq             # JSON processor (the original and authoritative one)
           - unzip
           - zip
           - tar
           - rsync
+          - p7zip-full     # 7z archive support
+          - unrar          # RAR archive extraction
           # ── System monitoring ────────────────────────────────────────────
-          - htop         # interactive process viewer
-          - btop         # modern resource monitor with graphs
-          - ncdu         # ncurses disk usage analyser
-          - tree         # recursive directory listing
+          - htop           # interactive process viewer
+          - btop           # modern resource monitor with graphs
+          - ncdu           # ncurses disk usage analyser
+          - tree           # recursive directory listing
+          # ── Modern CLI replacements ──────────────────────────────────────
+          - fzf            # fuzzy finder — transforms terminal workflow
+          - bat            # cat replacement with syntax highlighting
+          - eza            # ls/tree replacement (trixie has it in repos)
+          - ripgrep        # grep replacement — used by VS Code search internally
+          - fd-find        # find replacement (saner syntax, faster)
           # ── Terminal multiplexers ────────────────────────────────────────
-          - tmux
-          - screen
+          - tmux           # terminal multiplexer (screen is deliberately excluded)
           # ── Network utilities ────────────────────────────────────────────
-          - net-tools    # ifconfig, netstat (legacy but still useful)
-          - nmap         # network scanner
+          - net-tools      # ifconfig, netstat — legacy but useful for teaching
+          - nmap           # network scanner
           - traceroute
-          - dnsutils     # dig, nslookup, host
+          - dnsutils       # dig, nslookup, host
           - whois
           # ── SSH ──────────────────────────────────────────────────────────
           - openssh-client
           - openssh-server
           # ── Build tools ──────────────────────────────────────────────────
-          - build-essential  # gcc, g++, make, libc-dev
+          - build-essential    # gcc, g++, make, libc-dev
           - cmake
           - pkg-config
-          # ── Container runtime ────────────────────────────────────────────
-          - docker.io        # Docker CE engine from Debian repos
-          - docker-compose   # multi-container orchestration tool
-          # ── Ansible (ensure present; may have been installed from bootstrap) ─
+          # ── Secret management (GitOps, Module 6) ────────────────────────
+          - age                # modern file encryption (used with SOPS)
+          # ── Ansible (ensure present after optional bootstrap install) ────
           - ansible
         state: present
+      # Reason: fzf, bat, eza, ripgrep, fd-find are the modern replacements
+      # for fuzzy matching, cat, ls, grep, and find. These are tools students
+      # will actually use daily and see referenced in every modern tutorial.
+      # screen is excluded — tmux is the modern choice and teaching both
+      # creates confusion with no benefit.
+      # Note: yq is NOT installed from apt. The Debian 'yq' package is a
+      # Python wrapper with different syntax from the mikefarah Go binary
+      # that all documentation refers to. See Section 15 (yq).
 
     - name: "[DEVOPS] Add {{ real_user }} to docker group"
       ansible.builtin.user:
@@ -796,15 +797,98 @@
         groups: docker
         append: true
       # Reason: Without docker group membership, every docker command requires
-      # sudo. append: true is mandatory to avoid removing other group memberships.
+      # sudo. Note: docker group membership is equivalent to passwordless sudo
+      # for container operations — this is a documented Docker security tradeoff.
+      # append: true is mandatory to avoid removing other group memberships.
 
-    - name: "[DEVOPS] Enable and start Docker service"
+    - name: "[DEVOPS] Create fd → fdfind symlink"
+      ansible.builtin.file:
+        src: /usr/bin/fdfind
+        dest: /usr/local/bin/fd
+        state: link
+      # Reason: Debian packages fd-find as 'fdfind' to avoid a conflict with
+      # a legacy fdclone package. The entire world calls it 'fd'. This symlink
+      # makes the standard name work without requiring shell aliases.
+
+    # ==========================================================================
+    # SECTION 15 — yq (Go binary — mikefarah/yq)
+    # ==========================================================================
+
+    - name: "[YQ] Check if yq (Go) is already installed"
+      ansible.builtin.stat:
+        path: /usr/local/bin/yq
+      register: _yq_stat
+
+    - name: "[YQ] Install yq Go binary (mikefarah/yq)"
+      ansible.builtin.get_url:
+        url: https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+        dest: /usr/local/bin/yq
+        owner: root
+        group: root
+        mode: "0755"
+        force: false
+      when: not _yq_stat.stat.exists
+      # Reason: The Debian 'yq' package is a Python wrapper around jq that uses
+      # jq syntax — NOT yq syntax. Every tutorial, Stack Overflow answer, and
+      # documentation page for 'yq' refers to the Go-based mikefarah/yq, which
+      # uses a YAML-native query language. Installing the Debian package and
+      # then following any external yq resource will produce failures or wrong
+      # output. This installs the correct binary.
+      # To upgrade: delete /usr/local/bin/yq and re-run the playbook.
+
+    # ==========================================================================
+    # SECTION 16 — DOCKER CE (official Docker repository)
+    # ==========================================================================
+
+    - name: "[DOCKER] Download Docker GPG key and install to keyrings"
+      ansible.builtin.shell:
+        cmd: >
+          curl -fsSL https://download.docker.com/linux/debian/gpg
+          | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+        creates: /etc/apt/keyrings/docker.gpg
+      # Reason: Piping directly to gpg --dearmor handles both ASCII-armored
+      # and binary key formats gracefully. creates: makes this idempotent.
+
+    - name: "[DOCKER] Set correct permissions on Docker GPG key"
+      ansible.builtin.file:
+        path: /etc/apt/keyrings/docker.gpg
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: "[DOCKER] Add Docker CE apt repository"
+      ansible.builtin.apt_repository:
+        repo: >-
+          deb [arch=amd64
+          signed-by=/etc/apt/keyrings/docker.gpg]
+          https://download.docker.com/linux/debian trixie stable
+        state: present
+        filename: docker-ce
+        update_cache: true
+
+    - name: "[DOCKER] Install Docker CE"
+      ansible.builtin.apt:
+        name:
+          - docker-ce              # Docker Engine
+          - docker-ce-cli          # Docker CLI
+          - containerd.io          # Container runtime
+          - docker-buildx-plugin   # BuildKit extended build capabilities
+          - docker-compose-plugin  # 'docker compose' v2 (replaces docker-compose v1)
+        state: present
+      # Reason: docker.io (the Debian-packaged Docker) is multiple major versions
+      # behind Docker CE from Docker's official repository. docker-compose (v1,
+      # standalone Python binary) was deprecated in 2023. docker-compose-plugin
+      # is the current v2 implementation, invoked as 'docker compose' (no hyphen).
+
+    - name: "[DOCKER] Enable and start Docker service"
       ansible.builtin.systemd:
         name: docker
         enabled: true
         state: started
 
-    # ── kubectl ──────────────────────────────────────────────────────────────
+    # ==========================================================================
+    # SECTION 17 — kubectl
+    # ==========================================================================
 
     - name: "[KUBECTL] Download Kubernetes apt signing key"
       ansible.builtin.get_url:
@@ -812,8 +896,7 @@
         dest: /tmp/kubernetes-release.key
         mode: "0644"
         force: true
-      # Reason: force: true fetches a fresh copy so a key rotation is picked up.
-      # The key is then dearmored in the next task.
+      # Reason: force: true ensures a rotated key is always picked up.
 
     - name: "[KUBECTL] Dearmor Kubernetes GPG key"
       ansible.builtin.shell:
@@ -821,8 +904,6 @@
           gpg --dearmor < /tmp/kubernetes-release.key
           > /etc/apt/keyrings/kubernetes-apt-keyring.gpg
         creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-      # Reason: The creates: guard makes this idempotent — the dearmor step
-      # is skipped if the binary key file already exists.
 
     - name: "[KUBECTL] Add Kubernetes apt repository"
       ansible.builtin.apt_repository:
@@ -832,16 +913,17 @@
         state: present
         filename: kubernetes
         update_cache: true
-      # Reason: Kubernetes publishes per-minor-version repositories. kubectl_version
-      # in vars controls which version stream is tracked. Update that variable
-      # and re-run the playbook to switch streams.
+      # Reason: Kubernetes publishes per-minor-version apt repositories.
+      # Updating kubectl_version in vars and re-running switches version streams.
 
     - name: "[KUBECTL] Install kubectl"
       ansible.builtin.apt:
         name: kubectl
         state: present
 
-    # ── Helm ─────────────────────────────────────────────────────────────────
+    # ==========================================================================
+    # SECTION 18 — Helm
+    # ==========================================================================
 
     - name: "[HELM] Download Helm signing key"
       ansible.builtin.get_url:
@@ -872,7 +954,66 @@
         state: present
 
     # ==========================================================================
-    # SECTION 15 — SHELL AND TERMINAL SETUP
+    # SECTION 19 — k9s (terminal UI for Kubernetes)
+    # ==========================================================================
+
+    - name: "[K9S] Check if k9s is already installed"
+      ansible.builtin.stat:
+        path: /usr/local/bin/k9s
+      register: _k9s_stat
+
+    - name: "[K9S] Download k9s tarball"
+      ansible.builtin.get_url:
+        url: https://github.com/derailed/k9s/releases/latest/download/k9s_Linux_amd64.tar.gz
+        dest: /tmp/k9s.tar.gz
+        mode: "0644"
+      when: not _k9s_stat.stat.exists
+      # Reason: k9s is not in Debian repositories. GitHub releases is the
+      # official distribution channel.
+
+    - name: "[K9S] Extract k9s binary to /usr/local/bin"
+      ansible.builtin.unarchive:
+        src: /tmp/k9s.tar.gz
+        dest: /usr/local/bin/
+        remote_src: true
+        extra_opts:
+          - k9s     # extract only the k9s binary, skip LICENSE and README
+      when: not _k9s_stat.stat.exists
+      # Reason: k9s is the essential terminal UI for Kubernetes. Once students
+      # reach Module 5 (K3s) and Module 6 (ArgoCD), they will use k9s daily.
+      # Installing it now means it is ready without an additional setup step.
+
+    - name: "[K9S] Ensure k9s binary is executable"
+      ansible.builtin.file:
+        path: /usr/local/bin/k9s
+        mode: "0755"
+      when: not _k9s_stat.stat.exists
+
+    # ==========================================================================
+    # SECTION 20 — cosign (container image signing)
+    # ==========================================================================
+
+    - name: "[COSIGN] Check if cosign is already installed"
+      ansible.builtin.stat:
+        path: /usr/local/bin/cosign
+      register: _cosign_stat
+
+    - name: "[COSIGN] Install cosign binary"
+      ansible.builtin.get_url:
+        url: https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64
+        dest: /usr/local/bin/cosign
+        owner: root
+        group: root
+        mode: "0755"
+        force: false
+      when: not _cosign_stat.stat.exists
+      # Reason: cosign is required in Module 3 (container image pipeline) for
+      # signing and verifying images using sigstore. It is also required for
+      # supply-chain security verification in Module 6 (GitOps). Installing now
+      # avoids a mid-module setup interruption.
+
+    # ==========================================================================
+    # SECTION 21 — SHELL AND TERMINAL SETUP
     # ==========================================================================
 
     - name: "[SHELL] Install zsh"
@@ -885,15 +1026,14 @@
         name: "{{ real_user }}"
         shell: /bin/zsh
       # Reason: ansible.builtin.user writes directly to /etc/passwd, which is
-      # both idempotent and does not require user interaction (unlike chsh which
-      # prompts for a password and may fail inside Ansible's become context).
+      # idempotent and does not prompt for a password (unlike chsh).
 
     - name: "[SHELL] Check if oh-my-zsh is already installed"
       ansible.builtin.stat:
         path: "{{ real_home }}/.oh-my-zsh"
       register: _ohmyzsh_stat
 
-    - name: "[SHELL] Install oh-my-zsh (unattended, no shell switch)"
+    - name: "[SHELL] Install oh-my-zsh (unattended)"
       ansible.builtin.shell:
         cmd: >
           sh -c "$(curl -fsSL
@@ -905,11 +1045,8 @@
       when: not _ohmyzsh_stat.stat.exists
       environment:
         HOME: "{{ real_home }}"
-        RUNZSH: "no"    # prevents the installer from exec-ing zsh immediately
-        CHSH: "no"      # prevents a duplicate chsh call (we handle shell above)
-      # Reason: RUNZSH=no is critical — without it, the oh-my-zsh installer
-      # would exec zsh at the end of its script, hanging the Ansible task
-      # indefinitely. CHSH=no avoids a redundant interactive shell change.
+        RUNZSH: "no"    # prevents installer from exec-ing zsh — would hang Ansible
+        CHSH: "no"      # we set the shell via ansible.builtin.user above
 
     - name: "[SHELL] Clone zsh-autosuggestions plugin"
       ansible.builtin.git:
@@ -919,9 +1056,8 @@
         update: false
       become: true
       become_user: "{{ real_user }}"
-      # Reason: update: false makes git clone a no-op if the directory already
-      # exists, providing idempotency. Change to update: true to pull updates
-      # on every run.
+      # Reason: update: false — git clone is a no-op if the directory exists.
+      # Change to update: true to pull plugin updates on every playbook run.
 
     - name: "[SHELL] Clone zsh-syntax-highlighting plugin"
       ansible.builtin.git:
@@ -940,23 +1076,18 @@
         state: present
       become: true
       become_user: "{{ real_user }}"
-      # Reason: agnoster is a Powerline-based theme that displays the current
-      # git branch and working directory status in a visually clear format.
-      # It requires fonts-powerline (installed in the KDE section) to render
-      # arrow separators correctly.
 
     - name: "[SHELL] Enable plugins in .zshrc"
       ansible.builtin.lineinfile:
         path: "{{ real_home }}/.zshrc"
         regexp: '^plugins='
-        line: "plugins=(git zsh-autosuggestions zsh-syntax-highlighting)"
+        line: "plugins=(git fzf zsh-autosuggestions zsh-syntax-highlighting)"
         state: present
       become: true
       become_user: "{{ real_user }}"
-      # Reason: oh-my-zsh activates plugins by reading the plugins=() array in
-      # .zshrc. The git plugin adds aliases and VCS prompt info. The two community
-      # plugins were cloned in the tasks above; they must be listed here to be
-      # sourced at shell startup.
+      # Reason: The fzf oh-my-zsh plugin binds Ctrl-R (history search),
+      # Ctrl-T (file picker), and Alt-C (cd into directory) to fzf-powered
+      # fuzzy interfaces — a transformative improvement to terminal workflow.
 
     - name: "[SHELL] Add nvm init block to .zshrc"
       ansible.builtin.blockinfile:
@@ -970,79 +1101,112 @@
         create: true
       become: true
       become_user: "{{ real_user }}"
-      # Reason: nvm's own install script adds init lines to ~/.bashrc but does
-      # not touch ~/.zshrc. Without these lines, nvm and the node binary are
-      # unavailable in zsh sessions. blockinfile uses marker comments to locate
-      # and idempotently update the exact block on subsequent runs.
+      # Reason: nvm's install script appends init lines to ~/.bashrc but not
+      # ~/.zshrc. Without this block, nvm and node are unavailable in zsh.
 
     - name: "[SHELL] Add ~/.local/bin to PATH in .zshrc"
       ansible.builtin.blockinfile:
         path: "{{ real_home }}/.zshrc"
-        marker: "# {mark} ANSIBLE MANAGED BLOCK — local bin"
+        marker: "# {mark} ANSIBLE MANAGED BLOCK — local bin PATH"
         block: |
           export PATH="$HOME/.local/bin:$PATH"
         state: present
         create: true
       become: true
       become_user: "{{ real_user }}"
-      # Reason: pipx, uv, and pre-commit are installed to ~/.local/bin.
-      # This block ensures those tools are found in every interactive zsh session
-      # without requiring the user to manually edit .zshrc.
+      # Reason: pipx, uv, pre-commit, cookiecutter, and ansible-lint all
+      # install to ~/.local/bin. This block makes them available in every
+      # interactive zsh session without requiring the user to edit .zshrc.
+
+    - name: "[SHELL] Add useful shell aliases for modern CLI tools"
+      ansible.builtin.blockinfile:
+        path: "{{ real_home }}/.zshrc"
+        marker: "# {mark} ANSIBLE MANAGED BLOCK — modern CLI aliases"
+        block: |
+          # Modern CLI tool aliases — installed by devplatform.yml
+          alias cat='bat --paging=never'     # syntax-highlighted cat
+          alias ls='eza --icons'             # ls with icons and git status
+          alias ll='eza -la --icons --git'   # long listing with git status
+          alias tree='eza --tree --icons'    # directory tree
+          alias grep='rg'                    # ripgrep as default grep
+          alias find='fd'                    # fd as default find
+        state: present
+        create: true
+      become: true
+      become_user: "{{ real_user }}"
+      # Reason: These aliases replace legacy tools with their modern equivalents
+      # while keeping familiar command names. Students learn the new tools
+      # immediately without needing to remember new command names. They can
+      # override any alias by running the full path (e.g., /usr/bin/grep).
 
     # ==========================================================================
-    # SECTION 16 — FINAL SYSTEM UPGRADE AND CLEANUP
+    # SECTION 22 — FINAL SYSTEM UPGRADE AND CLEANUP
     # ==========================================================================
 
     - name: "[FINAL] Full system upgrade (dist-upgrade)"
       ansible.builtin.apt:
         upgrade: full
         update_cache: true
-      # Reason: A final full upgrade pulls in any security updates published
-      # after the initial bootstrap. This ensures the machine is not left with
-      # known vulnerabilities from the netinst ISO.
+      # Reason: Pulls in security updates published after the netinst ISO was
+      # created. Ensures the machine is not left with known vulnerabilities.
 
     - name: "[FINAL] Remove orphaned packages"
       ansible.builtin.apt:
         autoremove: true
         purge: true
-      # Reason: kde-full and other large metapackages may introduce packages
-      # that become orphaned once the metapackage itself is satisfied. Removing
-      # them keeps the system clean.
+
+    - name: "[FINAL] Clean apt package cache"
+      ansible.builtin.apt:
+        autoclean: true
+      # Reason: Removes downloaded .deb files from /var/cache/apt/archives
+      # that are no longer available in the repository. Keeps disk usage clean.
+
+    - name: "[FINAL] Remove temporary files created during bootstrap"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/microsoft.asc
+        - /tmp/kubernetes-release.key
+        - /tmp/helm-signing.asc
+        - /tmp/k9s.tar.gz
+        - /tmp/cursor-latest.deb
 
     - name: "[FINAL] Print post-install instructions"
       ansible.builtin.debug:
         msg:
-          - "════════════════════════════════════════════════════════════════"
+          - "═══════════════════════════════════════════════════════════════"
           - " ✔  Developer Platform Bootstrap — COMPLETE"
-          - "════════════════════════════════════════════════════════════════"
+          - "═══════════════════════════════════════════════════════════════"
           - ""
-          - "  REQUIRED STEPS AFTER THIS PLAYBOOK:"
+          - "  REQUIRED STEPS:"
           - ""
-          - "  1.  Reboot the machine:"
-          - "        sudo reboot"
-          - "      (Required for: GPU drivers, kernel modules, sddm, nouveau"
-          - "       blacklist, FUSE changes, and all group memberships.)"
+          - "  1. Reboot:"
+          - "       sudo reboot"
+          - "     Required for: GPU drivers, kernel modules, sddm,"
+          - "     nouveau blacklist, and all group memberships."
           - ""
-          - "  2.  After reboot, KDE Plasma will launch via sddm."
-          - "      Log in with your normal user credentials."
+          - "  2. After reboot, KDE Plasma starts via sddm."
+          - "     Log in with your normal user credentials."
           - ""
-          - "  3.  Open Konsole — your shell is now zsh with oh-my-zsh."
-          - "      The agnoster theme requires a Powerline-capable font in"
-          - "      Konsole settings (Fonts > Use Powerline font)."
+          - "  3. Open Konsole. Your shell is now zsh + oh-my-zsh."
+          - "     In Konsole Settings → Fonts, select a Powerline-capable"
+          - "     font (e.g., FiraCode Nerd Font or 'DejaVu Sans Mono')"
+          - "     for the agnoster theme arrows to render correctly."
           - ""
-          - "  4.  Group memberships (docker, libvirt, kvm) become effective"
-          - "      after the reboot / re-login."
+          - "  4. Set your git identity (per-user, not system-wide):"
+          - "       git config --global user.name  'Your Name'"
+          - "       git config --global user.email 'you@example.com'"
           - ""
-          - "  5.  Per-user tools available after opening a new zsh session:"
-          - "        node, npm, npx, pnpm, yarn, tsc, ts-node, nodemon"
-          - "        ansible-lint, pre-commit, cookiecutter (via pipx)"
-          - "        uv  (~/.local/bin/uv)"
+          - "  5. Authenticate the GitHub CLI:"
+          - "       gh auth login"
           - ""
-          - "  6.  Set your git identity (per user, not system-wide):"
-          - "        git config --global user.name  'Your Name'"
-          - "        git config --global user.email 'you@example.com'"
+          - "  6. Group memberships active after reboot:"
+          - "       docker, libvirt, kvm"
           - ""
-          - "  7.  Authenticate GitHub CLI:"
-          - "        gh auth login"
-          - ""
-          - "════════════════════════════════════════════════════════════════"
+          - "  7. Tools available in new zsh session:"
+          - "       node  npm  pnpm  yarn  tsc  ts-node  nodemon"
+          - "       ansible-lint  pre-commit  cookiecutter  uv"
+          - "       kubectl  helm  k9s  cosign  yq  jq  fzf"
+          - "       bat  eza  ripgrep (rg)  fd  age"
+          - "═══════════════════════════════════════════════════════════════"
