@@ -986,33 +986,49 @@
     # SECTION 18 — Helm
     # ==========================================================================
 
-    - name: "[HELM] Download Helm signing key"
+    - name: "[HELM] Set Helm version"
+      ansible.builtin.set_fact:
+        helm_version: "v4.1.4"
+        helm_arch: "amd64"
+
+    - name: "[HELM] Download Helm archive"
       ansible.builtin.get_url:
-        url: https://baltocdn.com/helm/signing.asc
-        dest: /tmp/helm-signing.asc
+        url: "https://get.helm.sh/helm-{{ helm_version }}-linux-{{ helm_arch }}.tar.gz"
+        dest: "/tmp/helm-{{ helm_version }}-linux-{{ helm_arch }}.tar.gz"
         mode: "0644"
-        force: true
 
-    - name: "[HELM] Dearmor Helm GPG key"
-      ansible.builtin.shell:
-        cmd: >
-          gpg --dearmor < /tmp/helm-signing.asc
-          > /usr/share/keyrings/helm.gpg
-        creates: /usr/share/keyrings/helm.gpg
+    - name: "[HELM] Download Helm checksum"
+      ansible.builtin.get_url:
+        url: "https://get.helm.sh/helm-{{ helm_version }}-linux-{{ helm_arch }}.tar.gz.sha256sum"
+        dest: "/tmp/helm-{{ helm_version }}-linux-{{ helm_arch }}.tar.gz.sha256sum"
+        mode: "0644"
 
-    - name: "[HELM] Add Helm stable apt repository"
-      ansible.builtin.apt_repository:
-        repo: >-
-          deb [arch=amd64 signed-by=/usr/share/keyrings/helm.gpg]
-          https://baltocdn.com/helm/stable/debian/ all main
-        state: present
-        filename: helm-stable-debian
-        update_cache: true
+    - name: "[HELM] Verify Helm checksum"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        cd /tmp
+        sha256sum -c "helm-{{ helm_version }}-linux-{{ helm_arch }}.tar.gz.sha256sum"
+      args:
+        executable: /bin/bash
 
-    - name: "[HELM] Install helm"
-      ansible.builtin.apt:
-        name: helm
-        state: present
+    - name: "[HELM] Extract Helm archive"
+      ansible.builtin.unarchive:
+        src: "/tmp/helm-{{ helm_version }}-linux-{{ helm_arch }}.tar.gz"
+        dest: /tmp
+        remote_src: true
+
+    - name: "[HELM] Install Helm binary"
+      ansible.builtin.copy:
+        src: "/tmp/linux-{{ helm_arch }}/helm"
+        dest: /usr/local/bin/helm
+        owner: root
+        group: root
+        mode: "0755"
+        remote_src: true
+
+    - name: "[HELM] Verify Helm installed"
+      ansible.builtin.command: /usr/local/bin/helm version --short
+      changed_when: false
 
     # ==========================================================================
     # SECTION 19 — k9s (terminal UI for Kubernetes)
