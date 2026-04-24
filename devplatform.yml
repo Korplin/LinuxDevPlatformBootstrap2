@@ -788,15 +788,7 @@
       # Python wrapper with different syntax from the mikefarah Go binary
       # that all documentation refers to. See Section 15 (yq).
 
-    - name: "[DEVOPS] Add {{ real_user }} to docker group"
-      ansible.builtin.user:
-        name: "{{ real_user }}"
-        groups: docker
-        append: true
-      # Reason: Without docker group membership, every docker command requires
-      # sudo. Note: docker group membership is equivalent to passwordless sudo
-      # for container operations — this is a documented Docker security tradeoff.
-      # append: true is mandatory to avoid removing other group memberships.
+
 
     - name: "[DEVOPS] Create fd → fdfind symlink"
       ansible.builtin.file:
@@ -876,6 +868,19 @@
       # behind Docker CE from Docker's official repository. docker-compose (v1,
       # standalone Python binary) was deprecated in 2023. docker-compose-plugin
       # is the current v2 implementation, invoked as 'docker compose' (no hyphen).
+
+      # My addition
+    - name: "[DEVOPS] Add {{ real_user }} to docker group"
+      ansible.builtin.user:
+        name: "{{ real_user }}"
+        groups: docker
+        append: true
+      # Reason: Without docker group membership, every docker command requires
+      # sudo. Note: docker group membership is equivalent to passwordless sudo
+      # for container operations — this is a documented Docker security tradeoff.
+      # append: true is mandatory to avoid removing other group memberships.
+
+
 
     - name: "[DOCKER] Enable and start Docker service"
       ansible.builtin.systemd:
