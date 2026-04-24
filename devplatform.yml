@@ -496,39 +496,65 @@
     # SECTION 10 — VISUAL STUDIO CODE
     # ==========================================================================
 
-    - name: "[VSCODE] Remove old conflicting VS Code repo files"
+    - name: "[VSCODE] Ensure required tools are installed"
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - gpg
+        state: present
+        update_cache: true
+
+    - name: "[VSCODE] Remove conflicting VS Code repository files"
       ansible.builtin.file:
         path: "{{ item }}"
         state: absent
       loop:
         - /etc/apt/sources.list.d/vscode.list
         - /etc/apt/sources.list.d/packages.microsoft.com_repos_code.list
+        - /etc/apt/sources.list.d/code.list
 
-    - name: "[VSCODE] Remove old conflicting Microsoft key"
+    - name: "[VSCODE] Remove conflicting Microsoft keyrings"
       ansible.builtin.file:
-        path: /etc/apt/keyrings/packages.microsoft.gpg
+        path: "{{ item }}"
         state: absent
+      loop:
+        - /etc/apt/keyrings/packages.microsoft.gpg
+        - /usr/share/keyrings/packages.microsoft.gpg
 
-    - name: "[VSCODE] Download Microsoft GPG key"
+    - name: "[VSCODE] Ensure /usr/share/keyrings exists"
+      ansible.builtin.file:
+        path: /usr/share/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: "[VSCODE] Download Microsoft signing key"
       ansible.builtin.get_url:
         url: https://packages.microsoft.com/keys/microsoft.asc
         dest: /tmp/microsoft.asc
         mode: "0644"
         force: true
 
-    - name: "[VSCODE] Dearmor Microsoft GPG key"
-      ansible.builtin.shell:
-        cmd: >
-          gpg --dearmor < /tmp/microsoft.asc
-          > /usr/share/keyrings/microsoft.gpg
+    - name: "[VSCODE] Install Microsoft signing key"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        gpg --dearmor < /tmp/microsoft.asc > /usr/share/keyrings/microsoft.gpg
+        chmod 0644 /usr/share/keyrings/microsoft.gpg
       args:
-        creates: /usr/share/keyrings/microsoft.gpg
+        executable: /bin/bash
+      changed_when: true
 
-    - name: "[VSCODE] Add Visual Studio Code apt repository"
-      ansible.builtin.apt_repository:
-        repo: "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/code stable main"
-        state: present
-        filename: vscode
+    - name: "[VSCODE] Add Visual Studio Code repository"
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/vscode.list
+        content: |
+          deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/code stable main
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: "[VSCODE] Update apt cache after adding VS Code repository"
+      ansible.builtin.apt:
         update_cache: true
 
     - name: "[VSCODE] Install Visual Studio Code"
