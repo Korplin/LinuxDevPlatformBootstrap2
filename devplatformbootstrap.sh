@@ -92,6 +92,25 @@ if [ -z "$REAL_USER" ] || [ "$REAL_USER" = "root" ]; then
 fi
 info "Target user for per-user configuration: ${REAL_USER:-root}"
 
+# Cleanup ast devplatformbootstrap.sh
+
+info "Cleaning conflicting Microsoft VS Code sources..."
+
+rm -f /etc/apt/sources.list.d/vscode.list
+rm -f /etc/apt/sources.list.d/vscode.sources
+rm -f /etc/apt/sources.list.d/code.list
+rm -f /etc/apt/sources.list.d/packages.microsoft.com_repos_code.list
+
+rm -f /etc/apt/keyrings/packages.microsoft.gpg
+rm -f /etc/apt/keyrings/microsoft.gpg
+rm -f /usr/share/keyrings/microsoft.gpg
+rm -f /usr/share/keyrings/packages.microsoft.gpg
+
+success "Old VS Code sources cleaned."
+
+
+
+
 # ── Refresh apt and install prerequisites ─────────────────────────────────────
 info "Updating apt package index..."
 apt-get update -qq
