@@ -82,15 +82,16 @@ success "Debian 13 (trixie) confirmed."
 # When invoked via sudo (the normal path), SUDO_USER is the original caller.
 # If run directly as root (bare-metal server), fall back to logname.
 REAL_USER="${SUDO_USER:-}"
+
 if [ -z "$REAL_USER" ]; then
   REAL_USER="$(logname 2>/dev/null || echo "")"
 fi
+
 if [ -z "$REAL_USER" ] || [ "$REAL_USER" = "root" ]; then
-  warn "Could not detect a non-root user."
-  warn "Per-user tools (nvm, oh-my-zsh, pipx, etc.) will be configured for root."
-  warn "This is unusual — prefer running as a normal user with sudo access."
+  die "Could not detect a non-root user. Run this script as your normal desktop user with sudo access, not directly as root."
 fi
-info "Target user for per-user configuration: ${REAL_USER:-root}"
+
+info "Target user for per-user configuration: ${REAL_USER}"
 
 # ── Refresh apt and install prerequisites ─────────────────────────────────────
 info "Updating apt package index..."
