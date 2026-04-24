@@ -496,6 +496,18 @@
     # SECTION 10 — VISUAL STUDIO CODE
     # ==========================================================================
 
+    # Clean
+    - name: "[VSCODE] Remove existing/conflicting Microsoft signing keys"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /usr/share/keyrings/microsoft.gpg
+        - /usr/share/keyrings/packages.microsoft.gpg
+        - /etc/apt/keyrings/packages.microsoft.gpg
+        - /etc/apt/keyrings/microsoft.gpg
+
+
     - name: "[VSCODE] Ensure required tools are installed"
       ansible.builtin.apt:
         name:
