@@ -193,15 +193,6 @@
     # SECTION 3 — GPU AND VIRTUALISATION DRIVERS
     # ==========================================================================
 
-    - name: "[GPU] Install KVM/QEMU guest utilities"
-      ansible.builtin.apt:
-        name:
-          - spice-vdagent            # clipboard and auto-resize in SPICE sessions
-          - qemu-guest-agent         # host↔guest communication channel
-          - xserver-xorg-video-qxl   # QXL display driver for QEMU virtual GPU
-        state: present
-      when: is_kvm and not is_virtualbox
-
     - name: "[GPU] Install linux kernel headers (required for NVIDIA DKMS)"
       ansible.builtin.apt:
         name:
